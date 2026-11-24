@@ -1,4 +1,4 @@
-"""In-memory member store. Phone uniqueness is check+insert under one lock."""
+"""In-memory stores. Every "may not" rule is check+insert under one lock."""
 import threading
 import uuid
 
@@ -31,3 +31,39 @@ class MemberStore:
         with self._lock:
             m = self._by_id.get(member_id)
             return dict(m) if m else None
+
+
+class PlanStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_id: dict[str, dict] = {}
+
+    def create(self, plan: dict) -> dict:
+        with self._lock:
+            if plan["id"] in self._by_id:
+                raise ApiError(409, "PLAN_EXISTS", "A plan with this id already exists")
+            self._by_id[plan["id"]] = dict(plan)
+            return dict(plan)
+
+    def get(self, plan_id: str) -> dict | None:
+        with self._lock:
+            p = self._by_id.get(plan_id)
+            return dict(p) if p else None
+
+
+class AgreementStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_id: dict[str, dict] = {}
+
+    def create(self, member_id: str, plan_id: str, start_date: str, due_day: int) -> dict:
+        with self._lock:
+            ag = {"id": str(uuid.uuid4()), "member_id": member_id, "plan_id": plan_id,
+                  "start_date": start_date, "due_day": due_day}
+            self._by_id[ag["id"]] = ag
+            return dict(ag)
+
+    def get(self, agreement_id: str) -> dict | None:
+        with self._lock:
+            a = self._by_id.get(agreement_id)
+            return dict(a) if a else None
