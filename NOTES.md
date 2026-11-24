@@ -15,13 +15,14 @@ Stack: Python 3.12, FastAPI, in-memory state (each run starts empty).
 - `app/phone.py`    phone cleaning and normalisation (pure)
 - `app/money.py`    integer half-up rounding, VAT, currency per country (pure)
 - `app/schedule.py` due dates, proration, invoice schedule (pure)
+- `app/reconcile.py` row validation + matching + verdicts (pure)
 - `app/store.py`    in-memory stores; check+insert under a lock
 - `app/main.py`     routes, strict hand-written validation, error handlers
 
 ## Status
 - Part 1 (members + phones): done.
 - Part 2 (plans, agreements, invoice schedule): done.
-- Part 3 (reconciliation): not started.
+- Part 3 (reconciliation): done.
 
 ## Assumptions: general
 - Bodies and query strings are parsed by hand (no Pydantic models) so every bad input yields the contract error shape.
@@ -51,6 +52,16 @@ Stack: Python 3.12, FastAPI, in-memory state (each run starts empty).
 - Invoice k >= 2 is due in month index (N's month + k - 2); invoice_no is computed from that position, so it never restarts inside a range and nothing is stored.
 - Rounding happens exactly twice per invoice: prorated amount, then VAT on (prorated + joining_fee). Joining fee is on invoice 1 only.
 - VAT rates: AE 5%, SA 15%, BH 10%, applied as integer percent in minor units.
+
+## Assumptions: Part 3 (reconciliation)
+- `month` must be `YYYY-MM` (ASCII digits, month 01-12, year 0001-9999).
+- Shape problems anywhere (bad month, `rows` not a list, a row not an object, a missing/mistyped field, bad `attempted_on` date, `amount` not an integer above 0, `status` not SETTLED/DECLINED) are 422 VALIDATION and win over INVALID_ROWS.
+- `gateway_txn_id` must be a non-empty string; `agreement_id` and `currency` must be strings (currency is not checked against a list of codes).
+- An empty `rows` list is valid: 201 with every expected invoice in `unmatched_invoices`.
+- INVALID_ROWS: one entry per offending row and code; both copies of a duplicated txn id get a DUPLICATE_TXN entry; DECLINED rows are validated too; CURRENCY_MISMATCH is skipped when the agreement is unknown.
+- Matching: each SETTLED row picks independently from ALL expected invoices of its own agreement (|total - amount| <= 1, earliest due date), so row order never matters and invoices already linked by other rows still count.
+- Expected invoices are computed from every agreement at request time with the Part 2 schedule; a run is stored as a snapshot and never changes members, plans or agreements.
+- DOUBLE_CHARGE_RISK rows still report the invoice they linked to.
 
 ## Skipped / known limits
 - A start date or range at the very end of year 9999 would overflow Python's date type (returns 500). Considered out of scope.

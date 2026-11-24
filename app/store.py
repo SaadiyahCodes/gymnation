@@ -67,3 +67,24 @@ class AgreementStore:
         with self._lock:
             a = self._by_id.get(agreement_id)
             return dict(a) if a else None
+
+    def all(self) -> list[dict]:
+        with self._lock:
+            return [dict(a) for a in self._by_id.values()]
+
+
+class RunStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_id: dict[str, dict] = {}
+
+    def create(self, body: dict) -> dict:
+        """body is the run without an id; returns the stored run (with id)."""
+        with self._lock:
+            run = {"id": str(uuid.uuid4()), **body}
+            self._by_id[run["id"]] = run
+            return run
+
+    def get(self, run_id: str) -> dict | None:
+        with self._lock:
+            return self._by_id.get(run_id)

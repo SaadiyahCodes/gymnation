@@ -3,6 +3,7 @@
 Request bodies and query strings are read manually (not via Pydantic models) so
 EVERY bad input maps to our own {"error": {...}} shape instead of FastAPI's default.
 """
+import calendar
 import re
 from datetime import date
 
@@ -14,14 +15,17 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .errors import ApiError, validation
 from .money import CURRENCY
 from .phone import COUNTRIES, normalize_for_lookup, normalize_for_member
+from .reconcile import reconcile, row_errors
 from .schedule import invoices_in_range
-from .store import AgreementStore, MemberStore, PlanStore
+from .store import AgreementStore, MemberStore, PlanStore, RunStore
 
 app = FastAPI()
 members = MemberStore()
 plans = PlanStore()
 agreements = AgreementStore()
+runs = RunStore()
 
+_MONTH = re.compile(r"[0-9]{4}-[0-9]{2}")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")  # [0-9], not \d (no Arabic-Indic digits)
 
 
@@ -181,3 +185,83 @@ async def agreement_invoices(agreement_id: str, request: Request):
     plan = plans.get(agreement["plan_id"])
     return invoices_in_range(date.fromisoformat(agreement["start_date"]), agreement["due_day"],
                              plan["monthly"], plan["joining_fee"], plan["country"], frm, to)
+
+
+# ---------- Part 3: reconciliation ----------
+
+def _parse_month(value) -> tuple[date, date]:
+    """'YYYY-MM' -> (first day, last day)."""
+    if not isinstance(value, str) or not _MONTH.fullmatch(value):
+        raise validation("month must be formatted YYYY-MM")
+    year, month = int(value[:4]), int(value[5:])
+    if not 1 <= month <= 12 or year < 1:
+        raise validation("month is not a real calendar month")
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _parse_row(raw, index: int) -> dict:
+    if not isinstance(raw, dict):
+        raise validation(f"rows[{index}] must be an object")
+    txn, agreement_id = raw.get("gateway_txn_id"), raw.get("agreement_id")
+    amount, currency, status = raw.get("amount"), raw.get("currency"), raw.get("status")
+    if not isinstance(txn, str) or txn == "":
+        raise validation(f"rows[{index}].gateway_txn_id must be a non-empty string")
+    if not isinstance(agreement_id, str):
+        raise validation(f"rows[{index}].agreement_id must be a string")
+    if not _is_int(amount) or amount <= 0:
+        raise validation(f"rows[{index}].amount must be an integer above 0")
+    if not isinstance(currency, str):
+        raise validation(f"rows[{index}].currency must be a string")
+    if status not in ("SETTLED", "DECLINED"):
+        raise validation(f"rows[{index}].status must be SETTLED or DECLINED")
+    attempted = _parse_date(raw.get("attempted_on"), f"rows[{index}].attempted_on")
+    return {"gateway_txn_id": txn, "agreement_id": agreement_id, "amount": amount,
+            "currency": currency, "status": status, "attempted_on": attempted.isoformat()}
+
+
+def _currency_of(agreement_id: str):
+    agreement = agreements.get(agreement_id)
+    if agreement is None:
+        return None
+    plan = plans.get(agreement["plan_id"])
+    return plan["currency"] if plan else None
+
+
+def _expected_invoices(first: date, last: date) -> dict:
+    """Every invoice of every agreement whose due_date falls in [first, last]."""
+    expected: dict[str, list[dict]] = {}
+    for ag in agreements.all():
+        plan = plans.get(ag["plan_id"])
+        found = invoices_in_range(date.fromisoformat(ag["start_date"]), ag["due_day"],
+                                  plan["monthly"], plan["joining_fee"], plan["country"],
+                                  first, last)
+        if found:
+            expected[ag["id"]] = found
+    return expected
+
+
+@app.post("/reconciliation/runs", status_code=201)
+async def create_run(request: Request):
+    body = await _json_object(request)
+
+    first, last = _parse_month(body.get("month"))
+    raw_rows = body.get("rows")
+    if not isinstance(raw_rows, list):
+        raise validation("rows must be a list")
+    rows = [_parse_row(r, i) for i, r in enumerate(raw_rows)]  # shape errors first
+
+    month = body["month"]
+    errors = row_errors(month, rows, _currency_of)
+    if errors:
+        raise ApiError(422, "INVALID_ROWS", "One or more rows are invalid", errors=errors)
+
+    result = reconcile(rows, _expected_invoices(first, last))
+    return runs.create({"month": month, **result})
+
+
+@app.get("/reconciliation/runs/{run_id}")
+async def get_run(run_id: str):
+    run = runs.get(run_id)
+    if run is None:
+        raise ApiError(404, "NOT_FOUND", "No reconciliation run with that id")
+    return run
